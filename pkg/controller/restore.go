@@ -32,6 +32,9 @@ func (m *EtcdController) restoreBackupAndLiftQuarantine(parentContext context.Co
 			if info == nil || info.EtcdVersion == "" {
 				glog.Warningf("etcd version not found in %q", backup)
 				continue
+			} else if info.IsCommand {
+				glog.V(2).Infof("ignoring command %q", backup)
+				continue
 			} else {
 				restoreRequest = &protoetcd.DoRestoreRequest{
 					LeadershipToken: m.leadership.token,

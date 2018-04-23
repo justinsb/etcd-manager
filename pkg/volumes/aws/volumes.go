@@ -18,7 +18,6 @@ package aws
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,10 +30,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/golang/glog"
-	"k8s.io/kops/protokube/pkg/etcd"
-	"k8s.io/kops/protokube/pkg/gossip"
-	gossipaws "k8s.io/kops/protokube/pkg/gossip/aws"
-	"k8s.io/kops/upup/pkg/fi/cloudup/awsup"
+
+	"kope.io/etcd-manager/pkg/volumes"
 )
 
 var devices = []string{"/dev/xvdu", "/dev/xvdv", "/dev/xvdx", "/dev/xvdx", "/dev/xvdy", "/dev/xvdz"}
@@ -43,21 +40,36 @@ var devices = []string{"/dev/xvdu", "/dev/xvdv", "/dev/xvdx", "/dev/xvdx", "/dev
 type AWSVolumes struct {
 	mutex sync.Mutex
 
-	clusterTag string
+	matchTagKeys []string
+	matchTags    map[string]string
+
 	deviceMap  map[string]string
 	ec2        *ec2.EC2
-	instanceId string
-	internalIP net.IP
+	instanceID string
 	metadata   *ec2metadata.EC2Metadata
 	zone       string
+
+	// endpointFormat is the format string to transform an address into a discovery endpoint
+	endpointFormat string
 }
 
 var _ volumes.Volumes = &AWSVolumes{}
 
 // NewAWSVolumes returns a new aws volume provider
-func NewAWSVolumes() (*AWSVolumes, error) {
+func NewAWSVolumes(volumeTags []string, endpointFormat string) (*AWSVolumes, error) {
 	a := &AWSVolumes{
-		deviceMap: make(map[string]string),
+		deviceMap:      make(map[string]string),
+		matchTags:      make(map[string]string),
+		endpointFormat: endpointFormat,
+	}
+
+	for _, volumeTag := range volumeTags {
+		tokens := strings.SplitN(volumeTag, "=", 2)
+		if len(tokens) == 1 {
+			a.matchTagKeys = append(a.matchTagKeys, tokens[0])
+		} else {
+			a.matchTags[tokens[0]] = tokens[1]
+		}
 	}
 
 	config := aws.NewConfig()
@@ -84,58 +96,19 @@ func NewAWSVolumes() (*AWSVolumes, error) {
 		return nil, fmt.Errorf("error querying ec2 metadata service (for az): %v", err)
 	}
 
-	a.instanceId, err = a.metadata.GetMetadata("instance-id")
+	a.instanceID, err = a.metadata.GetMetadata("instance-id")
 	if err != nil {
 		return nil, fmt.Errorf("error querying ec2 metadata service (for instance-id): %v", err)
 	}
 
 	a.ec2 = ec2.New(s, config.WithRegion(region))
 
-	err = a.discoverTags()
-	if err != nil {
-		return nil, err
-	}
-
 	return a, nil
-}
-
-func (a *AWSVolumes) ClusterID() string {
-	return a.clusterTag
-}
-
-func (a *AWSVolumes) InternalIP() net.IP {
-	return a.internalIP
-}
-
-func (a *AWSVolumes) discoverTags() error {
-	instance, err := a.describeInstance()
-	if err != nil {
-		return err
-	}
-
-	tagMap := make(map[string]string)
-	for _, tag := range instance.Tags {
-		tagMap[aws.StringValue(tag.Key)] = aws.StringValue(tag.Value)
-	}
-
-	clusterID := tagMap[awsup.TagClusterName]
-	if clusterID == "" {
-		return fmt.Errorf("Cluster tag %q not found on this instance (%q)", awsup.TagClusterName, a.instanceId)
-	}
-
-	a.clusterTag = clusterID
-
-	a.internalIP = net.ParseIP(aws.StringValue(instance.PrivateIpAddress))
-	if a.internalIP == nil {
-		return fmt.Errorf("Internal IP not found on this instance (%q)", a.instanceId)
-	}
-
-	return nil
 }
 
 func (a *AWSVolumes) describeInstance() (*ec2.Instance, error) {
 	request := &ec2.DescribeInstancesInput{}
-	request.InstanceIds = []*string{&a.instanceId}
+	request.InstanceIds = []*string{&a.instanceID}
 
 	var instances []*ec2.Instance
 	err := a.ec2.DescribeInstancesPages(request, func(p *ec2.DescribeInstancesOutput, lastPage bool) (shouldContinue bool) {
@@ -145,11 +118,11 @@ func (a *AWSVolumes) describeInstance() (*ec2.Instance, error) {
 		return true
 	})
 	if err != nil {
-		return nil, fmt.Errorf("error querying for EC2 instance %q: %v", a.instanceId, err)
+		return nil, fmt.Errorf("error querying for EC2 instance %q: %v", a.instanceID, err)
 	}
 
 	if len(instances) != 1 {
-		return nil, fmt.Errorf("unexpected number of instances found with id %q: %d", a.instanceId, len(instances))
+		return nil, fmt.Errorf("unexpected number of instances found with id %q: %d", a.instanceID, len(instances))
 	}
 
 	return instances[0], nil
@@ -165,14 +138,14 @@ func newEc2Filter(name string, value string) *ec2.Filter {
 	return filter
 }
 
-func (a *AWSVolumes) findVolumes(request *ec2.DescribeVolumesInput) ([]*Volume, error) {
-	var volumes []*Volume
+func (a *AWSVolumes) describeVolumes(request *ec2.DescribeVolumesInput) ([]*volumes.Volume, error) {
+	var found []*volumes.Volume
 	err := a.ec2.DescribeVolumesPages(request, func(p *ec2.DescribeVolumesOutput, lastPage bool) (shouldContinue bool) {
 		for _, v := range p.Volumes {
 			volumeID := aws.StringValue(v.VolumeId)
-			vol := &Volume{
+			vol := &volumes.Volume{
 				ID: volumeID,
-				Info: VolumeInfo{
+				Info: volumes.VolumeInfo{
 					Description: volumeID,
 				},
 			}
@@ -182,7 +155,7 @@ func (a *AWSVolumes) findVolumes(request *ec2.DescribeVolumesInput) ([]*Volume, 
 
 			for _, attachment := range v.Attachments {
 				vol.AttachedTo = aws.StringValue(attachment.InstanceId)
-				if aws.StringValue(attachment.InstanceId) == a.instanceId {
+				if aws.StringValue(attachment.InstanceId) == a.instanceID {
 					vol.LocalDevice = aws.StringValue(attachment.Device)
 				}
 			}
@@ -194,46 +167,7 @@ func (a *AWSVolumes) findVolumes(request *ec2.DescribeVolumesInput) ([]*Volume, 
 				continue
 			}
 
-			skipVolume := false
-
-			for _, tag := range v.Tags {
-				k := aws.StringValue(tag.Key)
-				v := aws.StringValue(tag.Value)
-
-				switch k {
-				case awsup.TagClusterName, "Name":
-					{
-						// Ignore
-					}
-				//case TagNameMasterId:
-				//	id, err := strconv.Atoi(v)
-				//	if err != nil {
-				//		glog.Warningf("error parsing master-id tag on volume %q %s=%s; skipping volume", volumeID, k, v)
-				//		skipVolume = true
-				//	} else {
-				//		vol.Info.MasterID = id
-				//	}
-				default:
-					if strings.HasPrefix(k, awsup.TagNameEtcdClusterPrefix) {
-						etcdClusterName := strings.TrimPrefix(k, awsup.TagNameEtcdClusterPrefix)
-						spec, err := etcd.ParseEtcdClusterSpec(etcdClusterName, v)
-						if err != nil {
-							// Fail safe
-							glog.Warningf("error parsing etcd cluster tag %q on volume %q; skipping volume: %v", v, volumeID, err)
-							skipVolume = true
-						}
-						vol.Info.EtcdClusters = append(vol.Info.EtcdClusters, spec)
-					} else if strings.HasPrefix(k, awsup.TagNameRolePrefix) {
-						// Ignore
-					} else {
-						glog.Warningf("unknown tag on volume %q: %s=%s", volumeID, k, v)
-					}
-				}
-			}
-
-			if !skipVolume {
-				volumes = append(volumes, vol)
-			}
+			found = append(found, vol)
 		}
 		return true
 	})
@@ -241,31 +175,42 @@ func (a *AWSVolumes) findVolumes(request *ec2.DescribeVolumesInput) ([]*Volume, 
 	if err != nil {
 		return nil, fmt.Errorf("error querying for EC2 volumes: %v", err)
 	}
-	return volumes, nil
+	return found, nil
 }
 
-func (a *AWSVolumes) FindVolumes() ([]*Volume, error) {
+func (a *AWSVolumes) FindVolumes() ([]*volumes.Volume, error) {
+	return a.findVolumes(true)
+}
+
+func (a *AWSVolumes) findVolumes(filterByAZ bool) ([]*volumes.Volume, error) {
 	request := &ec2.DescribeVolumesInput{}
-	request.Filters = []*ec2.Filter{
-		newEc2Filter("tag:"+awsup.TagClusterName, a.clusterTag),
-		newEc2Filter("tag-key", awsup.TagNameRolePrefix+awsup.TagRoleMaster),
-		newEc2Filter("availability-zone", a.zone),
+
+	if filterByAZ {
+		request.Filters = append(request.Filters, newEc2Filter("availability-zone", a.zone))
 	}
 
-	return a.findVolumes(request)
+	for k, v := range a.matchTags {
+		request.Filters = append(request.Filters, newEc2Filter("tag:"+k, v))
+	}
+	for _, k := range a.matchTagKeys {
+		request.Filters = append(request.Filters, newEc2Filter("tag-key", k))
+	}
+
+	return a.describeVolumes(request)
 }
 
 // FindMountedVolume implements Volumes::FindMountedVolume
-func (v *AWSVolumes) FindMountedVolume(volume *Volume) (string, error) {
+func (a *AWSVolumes) FindMountedVolume(volume *volumes.Volume) (string, error) {
 	device := volume.LocalDevice
 
-	_, err := os.Stat(pathFor(device))
+	_, err := os.Stat(volumes.PathFor(device))
 	if err == nil {
 		return device, nil
 	}
 	if !os.IsNotExist(err) {
 		return "", fmt.Errorf("error checking for device %q: %v", device, err)
 	}
+	glog.V(2).Infof("volume %s not mounted at %s", volume.ID, volumes.PathFor(device))
 
 	if volume.ID != "" {
 		expected := volume.ID
@@ -282,13 +227,14 @@ func (v *AWSVolumes) FindMountedVolume(volume *Volume) (string, error) {
 			glog.Infof("found nvme volume %q at %q", expected, device)
 			return device, nil
 		}
+		glog.V(2).Infof("volume %s not mounted at %s", volume.ID, expected)
 	}
 
 	return "", nil
 }
 
 func findNvmeVolume(findName string) (device string, err error) {
-	p := pathFor(filepath.Join("/dev/disk/by-id", findName))
+	p := volumes.PathFor(filepath.Join("/dev/disk/by-id", findName))
 	stat, err := os.Lstat(p)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -309,7 +255,7 @@ func findNvmeVolume(findName string) (device string, err error) {
 	}
 
 	// Reverse pathFor
-	devPath := pathFor("/dev")
+	devPath := volumes.PathFor("/dev")
 	if strings.HasPrefix(resolved, devPath) {
 		resolved = strings.Replace(resolved, devPath, "/dev", 1)
 	}
@@ -348,7 +294,7 @@ func (a *AWSVolumes) releaseDevice(d string, volumeID string) {
 }
 
 // AttachVolume attaches the specified volume to this instance, returning the mountpoint & nil if successful
-func (a *AWSVolumes) AttachVolume(volume *Volume) error {
+func (a *AWSVolumes) AttachVolume(volume *volumes.Volume) error {
 	volumeID := volume.ID
 
 	device := volume.LocalDevice
@@ -361,7 +307,7 @@ func (a *AWSVolumes) AttachVolume(volume *Volume) error {
 
 		request := &ec2.AttachVolumeInput{
 			Device:     aws.String(device),
-			InstanceId: aws.String(a.instanceId),
+			InstanceId: aws.String(a.instanceID),
 			VolumeId:   aws.String(volumeID),
 		}
 
@@ -379,7 +325,7 @@ func (a *AWSVolumes) AttachVolume(volume *Volume) error {
 			VolumeIds: []*string{&volumeID},
 		}
 
-		volumes, err := a.findVolumes(request)
+		volumes, err := a.describeVolumes(request)
 		if err != nil {
 			return fmt.Errorf("Error describing EBS volume %q: %v", volumeID, err)
 		}
@@ -393,7 +339,7 @@ func (a *AWSVolumes) AttachVolume(volume *Volume) error {
 
 		v := volumes[0]
 		if v.AttachedTo != "" {
-			if v.AttachedTo == a.instanceId {
+			if v.AttachedTo == a.instanceID {
 				// TODO: Wait for device to appear?
 
 				volume.LocalDevice = device

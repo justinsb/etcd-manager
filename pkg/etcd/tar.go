@@ -95,7 +95,7 @@ type gzFile struct {
 	File string
 }
 
-// gunzip will uncompress the file srcFile, writing it to destFile
+// expand will uncompress the file srcFile, writing it to destFile
 func (g *gzFile) expand(destFile string) error {
 	src, err := os.Open(g.File)
 	if err != nil {

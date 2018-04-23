@@ -46,17 +46,6 @@ type Volume struct {
 	Info VolumeInfo
 }
 
-func (v *Volume) String() string {
-	return DebugString(v)
-}
-
 type VolumeInfo struct {
 	Description string
-	//MasterID    int
-	// TODO: Maybe the events cluster can just be a PetSet - do we need it for boot?
-	EtcdClusters []*etcd.EtcdClusterSpec
-}
-
-func (v *VolumeInfo) String() string {
-	return DebugString(v)
 }

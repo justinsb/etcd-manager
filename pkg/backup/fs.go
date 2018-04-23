@@ -16,7 +16,7 @@ import (
 	"kope.io/etcd-manager/pkg/ioutils"
 )
 
-func NewFilesystemStore(u *url.URL) (Store, error) {
+func NewFilesystemStore(u *url.URL) (*filesystemStore, error) {
 	if u.Scheme != "file" {
 		return nil, fmt.Errorf("unexpected scheme for file store %q", u.String())
 	}

@@ -1,4 +1,4 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
 
 go_library(
     name = "go_default_library",
@@ -6,19 +6,13 @@ go_library(
         "boot.go",
         "interfaces.go",
         "mounter.go",
+        "nsenter_exec.go",
     ],
     importpath = "kope.io/etcd-manager/pkg/volumes",
     visibility = ["//visibility:public"],
     deps = [
         "//vendor/github.com/golang/glog:go_default_library",
-        "//vendor/k8s.io/apimachinery/pkg/util/sets:go_default_library",
         "//vendor/k8s.io/kubernetes/pkg/util/mount:go_default_library",
+        "//vendor/k8s.io/utils/exec:go_default_library",
     ],
-)
-
-go_test(
-    name = "go_default_test",
-    srcs = ["mounter_test.go"],
-    embed = [":go_default_library"],
-    deps = ["//vendor/k8s.io/kops/protokube/pkg/etcd:go_default_library"],
 )

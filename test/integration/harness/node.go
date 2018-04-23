@@ -35,21 +35,21 @@ func (n *TestHarnessNode) Run() {
 	t := n.TestHarness.T
 	ctx := n.TestHarness.Context
 
-	address := n.Address
+	grpcPort := n.TestHarness.GrpcPort
+	nodeEndpoint := fmt.Sprintf("%s:%d", n.Address, grpcPort)
 
-	glog.Infof("Starting node %q", address)
+	glog.Infof("Starting node %q", nodeEndpoint)
 
 	uniqueID, err := privateapi.PersistentPeerId(n.NodeDir)
 	if err != nil {
 		t.Fatalf("error getting persistent peer id: %v", err)
 	}
 
-	grpcPort := 8000
 	discoMe := discovery.Node{
 		ID: string(uniqueID),
 	}
-	discoMe.Addresses = append(discoMe.Addresses, discovery.NodeAddress{
-		Address: fmt.Sprintf("%s:%d", n.Address, grpcPort),
+	discoMe.Endpoints = append(discoMe.Endpoints, discovery.NodeEndpoint{
+		Endpoint: nodeEndpoint,
 	})
 	p, err := vfs.Context.BuildVfsPath(n.TestHarness.DiscoveryStoreDir)
 	if err != nil {
@@ -60,10 +60,10 @@ func (n *TestHarnessNode) Run() {
 		glog.Fatalf("error building discovery: %v", err)
 	}
 
-	grpcAddress := fmt.Sprintf("%s:%d", address, grpcPort)
+	grpcAddress := fmt.Sprintf("%s:%d", nodeEndpoint, grpcPort)
 	myInfo := privateapi.PeerInfo{
 		Id:        string(uniqueID),
-		Addresses: []string{address},
+		Endpoints: []string{nodeEndpoint},
 	}
 	peerServer, err := privateapi.NewServer(ctx, myInfo, disco)
 	peerServer.PingInterval = time.Second
@@ -82,15 +82,15 @@ func (n *TestHarnessNode) Run() {
 	//}
 	var clientUrls []string
 	clientPort := 4001
-	clientUrls = append(clientUrls, fmt.Sprintf("http://%s:%d", address, clientPort))
+	clientUrls = append(clientUrls, fmt.Sprintf("http://%s:%d", n.Address, clientPort))
 
 	var quarantinedClientUrls []string
 	quarantinedClientPort := 4002
-	quarantinedClientUrls = append(quarantinedClientUrls, fmt.Sprintf("http://%s:%d", address, quarantinedClientPort))
+	quarantinedClientUrls = append(quarantinedClientUrls, fmt.Sprintf("http://%s:%d", n.Address, quarantinedClientPort))
 
 	var peerUrls []string
 	peerPort := 2380
-	peerUrls = append(peerUrls, fmt.Sprintf("http://%s:%d", address, peerPort))
+	peerUrls = append(peerUrls, fmt.Sprintf("http://%s:%d", n.Address, peerPort))
 
 	me := &apis_etcd.EtcdNode{
 		Name:                  string(uniqueID),

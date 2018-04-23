@@ -19,11 +19,9 @@ package volumes
 import (
 	"fmt"
 	"os"
-	"sort"
 	"time"
 
 	"github.com/golang/glog"
-	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/util/mount"
 )
 
@@ -50,6 +48,11 @@ func (k *VolumeMountController) mountMasterVolumes() ([]*Volume, error) {
 	}
 
 	for _, v := range attached {
+		if len(k.mounted) > 0 {
+			// We only attempt to mount a single volume
+			break
+		}
+
 		existing := k.mounted[v.ID]
 		if existing != nil {
 			continue
@@ -60,7 +63,7 @@ func (k *VolumeMountController) mountMasterVolumes() ([]*Volume, error) {
 		mountpoint := "/mnt/master-" + v.ID
 
 		// On ContainerOS, we mount to /mnt/disks instead (/mnt is readonly)
-		_, err := os.Stat(pathFor("/mnt/disks"))
+		_, err := os.Stat(PathFor("/mnt/disks"))
 		if err != nil {
 			if !os.IsNotExist(err) {
 				return nil, fmt.Errorf("error checking for /mnt/disks: %v", err)
@@ -104,7 +107,7 @@ func (k *VolumeMountController) safeFormatAndMount(volume *Volume, mountpoint st
 			break
 		}
 
-		glog.Infof("Waiting for volume %q to be attached", volume.ID)
+		glog.Infof("Waiting for volume %q to be mounted", volume.ID)
 		time.Sleep(1 * time.Second)
 	}
 	glog.Infof("Found volume %q mounted at device %q", volume.ID, device)
@@ -116,7 +119,7 @@ func (k *VolumeMountController) safeFormatAndMount(volume *Volume, mountpoint st
 		safeFormatAndMount.Interface = mount.NewNsenterMounter()
 		safeFormatAndMount.Exec = NewNsEnterExec()
 
-		// Note that we don't use pathFor for operations going through safeFormatAndMount,
+		// Note that we don't use PathFor for operations going through safeFormatAndMount,
 		// because NewNsenterMounter and NewNsEnterExec will operate in the host
 	} else {
 		safeFormatAndMount.Interface = mount.New("")
@@ -134,7 +137,7 @@ func (k *VolumeMountController) safeFormatAndMount(volume *Volume, mountpoint st
 	for i := range mounts {
 		m := &mounts[i]
 		glog.V(8).Infof("found existing mount: %v", m)
-		// Note: when containerized, we still list mounts in the host, so we don't need to call pathFor(mountpoint)
+		// Note: when containerized, we still list mounts in the host, so we don't need to call PathFor(mountpoint)
 		if m.Path == mountpoint {
 			existing = append(existing, m)
 		}
@@ -144,8 +147,8 @@ func (k *VolumeMountController) safeFormatAndMount(volume *Volume, mountpoint st
 	if len(existing) == 0 {
 		options := []string{}
 
-		glog.Infof("Creating mount directory %q", pathFor(mountpoint))
-		if err := os.MkdirAll(pathFor(mountpoint), 0750); err != nil {
+		glog.Infof("Creating mount directory %q", PathFor(mountpoint))
+		if err := os.MkdirAll(PathFor(mountpoint), 0750); err != nil {
 			return err
 		}
 
@@ -175,8 +178,8 @@ func (k *VolumeMountController) safeFormatAndMount(volume *Volume, mountpoint st
 	// If we're containerized we also want to mount the device (again) into our container
 	// We could also do this with mount propagation, but this is simple
 	if Containerized {
-		source := pathFor(device)
-		target := pathFor(mountpoint)
+		source := PathFor(device)
+		target := PathFor(mountpoint)
 		options := []string{}
 
 		mounter := mount.New("")
@@ -211,10 +214,6 @@ func (k *VolumeMountController) attachMasterVolumes() ([]*Volume, error) {
 	var tryAttach []*Volume
 	var attached []*Volume
 	for _, v := range volumes {
-		if doNotMountVolume(v) {
-			continue
-		}
-
 		if v.AttachedTo == "" {
 			tryAttach = append(tryAttach, v)
 		}
@@ -227,29 +226,11 @@ func (k *VolumeMountController) attachMasterVolumes() ([]*Volume, error) {
 		return attached, nil
 	}
 
-	// Make sure we don't try to mount multiple volumes from the same cluster
-	attachedClusters := sets.NewString()
-	for _, attached := range attached {
-		for _, etcdCluster := range attached.Info.EtcdClusters {
-			attachedClusters.Insert(etcdCluster.ClusterKey)
-		}
-	}
-
-	// Mount in a consistent order
-	sort.Stable(ByEtcdClusterName(tryAttach))
-
 	// Actually attempt the mounting
 	for _, v := range tryAttach {
-		alreadyMounted := ""
-		for _, etcdCluster := range v.Info.EtcdClusters {
-			if attachedClusters.Has(etcdCluster.ClusterKey) {
-				alreadyMounted = etcdCluster.ClusterKey
-			}
-		}
-
-		if alreadyMounted != "" {
-			glog.V(2).Infof("Skipping mount of master volume %q, because etcd cluster %q is already mounted", v.ID, alreadyMounted)
-			continue
+		if len(attached) > 0 {
+			// We only attempt to mount a single volume
+			break
 		}
 
 		glog.V(2).Infof("Trying to mount master volume: %q", v.ID)
@@ -263,46 +244,9 @@ func (k *VolumeMountController) attachMasterVolumes() ([]*Volume, error) {
 				glog.Fatalf("AttachVolume did not set LocalDevice")
 			}
 			attached = append(attached, v)
-
-			// Mark this cluster as attached now
-			for _, etcdCluster := range v.Info.EtcdClusters {
-				attachedClusters.Insert(etcdCluster.ClusterKey)
-			}
 		}
 	}
 
 	glog.V(2).Infof("Currently attached volumes: %v", attached)
 	return attached, nil
-}
-
-// doNotMountVolume tests that the volume has an Etcd Cluster associated
-func doNotMountVolume(v *Volume) bool {
-	if len(v.Info.EtcdClusters) == 0 {
-		glog.Warningf("Local device: %q, volume id: %q is being skipped and will not mounted, since it does not have a etcd cluster", v.LocalDevice, v.ID)
-		return true
-	}
-	return false
-}
-
-// ByEtcdClusterName sorts volumes so that we mount in a consistent order,
-// and in addition we try to mount the main etcd volume before the events etcd volume
-type ByEtcdClusterName []*Volume
-
-func (a ByEtcdClusterName) Len() int {
-	return len(a)
-}
-func (a ByEtcdClusterName) Swap(i, j int) {
-	a[i], a[j] = a[j], a[i]
-}
-func (a ByEtcdClusterName) Less(i, j int) bool {
-	nameI := ""
-	if len(a[i].Info.EtcdClusters) > 0 {
-		nameI = a[i].Info.EtcdClusters[0].ClusterKey
-	}
-	nameJ := ""
-	if len(a[j].Info.EtcdClusters) > 0 {
-		nameJ = a[j].Info.EtcdClusters[0].ClusterKey
-	}
-	// reverse so "main" comes before "events"
-	return nameI > nameJ
 }

@@ -26,7 +26,8 @@ type TestHarness struct {
 	BackupStorePath   string
 	DiscoveryStoreDir string
 
-	WorkDir string
+	GrpcPort int
+	WorkDir  string
 
 	Nodes map[string]*TestHarnessNode
 
@@ -48,6 +49,7 @@ func NewTestHarness(t *testing.T, ctx context.Context) *TestHarness {
 		WorkDir:     path.Join(tmpDir, clusterName),
 		Nodes:       make(map[string]*TestHarnessNode),
 		Context:     ctx,
+		GrpcPort:    8000,
 	}
 
 	// To test with S3:

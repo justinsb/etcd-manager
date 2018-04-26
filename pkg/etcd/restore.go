@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
 	protoetcd "kope.io/etcd-manager/pkg/apis/etcd"
 	"kope.io/etcd-manager/pkg/backup"
 	"kope.io/etcd-manager/pkg/etcdclient"
@@ -23,13 +24,8 @@ func (s *EtcdServer) DoRestore(ctx context.Context, request *protoetcd.DoRestore
 
 	response := &protoetcd.DoRestoreResponse{}
 
-	if s.clusterName != request.ClusterName {
-		glog.Infof("request had incorrect ClusterName.  ClusterName=%q but request=%q", s.clusterName, request)
-		return nil, fmt.Errorf("ClusterName mismatch")
-	}
-
-	if !s.peerServer.IsLeader(request.LeadershipToken) {
-		return nil, fmt.Errorf("LeadershipToken in request %q is not current leader", request.LeadershipToken)
+	if err := s.validateHeader(request.Header); err != nil {
+		return nil, err
 	}
 
 	if s.process == nil {
@@ -41,6 +37,15 @@ func (s *EtcdServer) DoRestore(ctx context.Context, request *protoetcd.DoRestore
 	}
 	if request.BackupName == "" {
 		return nil, fmt.Errorf("BackupName is required")
+	}
+
+	{
+		// TODO: Make this optional?
+		newState := proto.Clone(s.nodeState).(*protoetcd.NodeState)
+		newState.ClusterSpecVersion = request.Header.ClusterSpec
+		if err := s.updateState(newState); err != nil {
+			return nil, err
+		}
 	}
 
 	backupStore, err := backup.NewStore(request.Storage)

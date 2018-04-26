@@ -3,14 +3,18 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/golang/glog"
+	"github.com/golang/protobuf/proto"
 	protoetcd "kope.io/etcd-manager/pkg/apis/etcd"
 )
 
-func (m *EtcdController) stopForUpgrade(parentContext context.Context, clusterSpec *protoetcd.ClusterSpec, clusterState *etcdClusterState) (bool, error) {
+func (m *EtcdController) stopForUpgrade(parentContext context.Context, clusterState *etcdClusterState) (bool, error) {
 	// We start a new context - this is pretty critical-path
 	ctx := context.Background()
+
+	glog.Infof("Stopping cluster for upgrade")
 
 	// Sanity check
 	memberToPeer := make(map[EtcdMemberId]*peer)
@@ -35,27 +39,42 @@ func (m *EtcdController) stopForUpgrade(parentContext context.Context, clusterSp
 		return false, fmt.Errorf("cannot upgrade/downgrade cluster when not all members are healthy")
 	}
 
-	if len(clusterState.members) != int(clusterSpec.MemberCount) {
+	if len(clusterState.members) != int(m.clusterSpec.MemberCount) {
 		// We could relax this, but we probably don't want to
 		return false, fmt.Errorf("cannot upgrade/downgrade cluster when cluster is not at full member count")
 	}
 
 	// Force a backup, even before we start to do anything
-	if _, err := m.doClusterBackup(ctx, clusterSpec, clusterState); err != nil {
+	if _, err := m.doClusterBackup(ctx, clusterState); err != nil {
 		return false, fmt.Errorf("error doing backup before upgrade/downgrade: %v", err)
 	}
 
 	// We quarantine first, so that we don't have to get down to a single node before it is safe to do a backup
+	glog.Infof("quaranting cluster for upgrade")
 	if _, err := m.updateQuarantine(ctx, clusterState, true); err != nil {
 		return false, err
 	}
 
-	// We do a backup
-	backupResponse, err := m.doClusterBackup(ctx, clusterSpec, clusterState)
+	// We do another backup so we have the latest data
+	glog.Infof("backing up cluster after quarantine")
+	backupResponse, err := m.doClusterBackup(ctx, clusterState)
 	if err != nil {
 		return false, err
 	}
 	glog.Infof("backed up cluster as %v", backupResponse)
+
+	// Update all the nodes with the information that it is safe to restore from backup, in case we lose some
+	{
+		newClusterSpec := proto.Clone(m.clusterSpecVersion).(*protoetcd.ClusterSpecVersion)
+		// Don't restore backup again
+		newClusterSpec.ClusterSpec.RestoreBackup = backupResponse.Name
+		newClusterSpec.Timestamp = time.Now().UnixNano()
+
+		err := m.writeClusterSpec(ctx, clusterState, newClusterSpec)
+		if err != nil {
+			return false, err
+		}
+	}
 
 	// Stop the whole cluster
 	for memberId := range clusterState.members {
@@ -66,8 +85,7 @@ func (m *EtcdController) stopForUpgrade(parentContext context.Context, clusterSp
 		}
 
 		request := &protoetcd.StopEtcdRequest{
-			ClusterName:     m.clusterName,
-			LeadershipToken: m.leadership.token,
+			Header: m.buildHeader(),
 		}
 		response, err := peer.rpcStopEtcd(ctx, request)
 		if err != nil {

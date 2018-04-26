@@ -138,7 +138,7 @@ func (s *etcdClusterState) etcdGet(ctx context.Context, key string) ([]byte, err
 	return nil, fmt.Errorf("unable to reach any cluster member, when trying to read key %q", key)
 }
 
-func (s *etcdClusterState) etcdCreate(ctx context.Context, key string, value []byte) error {
+func (s *etcdClusterState) etcdPut(ctx context.Context, key string, value []byte) error {
 	for _, member := range s.members {
 		if len(member.ClientURLs) == 0 {
 			glog.Warningf("skipping member with no ClientURLs: %v", member)
@@ -154,7 +154,8 @@ func (s *etcdClusterState) etcdCreate(ctx context.Context, key string, value []b
 		err = etcdClient.Put(ctx, key, value)
 		etcdClient.Close()
 		if err != nil {
-			return fmt.Errorf("error creating %q on member %s: %v", key, member, err)
+			glog.Warningf("unable to put %q on member %s: %v", key, member, err)
+			continue
 		}
 
 		return nil

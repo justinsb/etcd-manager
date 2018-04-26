@@ -44,7 +44,7 @@ type filesystemStore struct {
 	backupsBase string
 }
 
-var _ Store = &filesystemStore{}
+//var _ Store = &filesystemStore{}
 
 func (s *filesystemStore) AddBackup(srcFile string, sequence string, info *etcd.BackupInfo) (string, error) {
 	now := time.Now()

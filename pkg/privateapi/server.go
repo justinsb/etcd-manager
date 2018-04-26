@@ -66,6 +66,8 @@ var _ ClusterServiceServer = &Server{}
 func (s *Server) ListenAndServe(ctx context.Context, listen string) error {
 	go s.runDiscovery(ctx)
 
+	glog.Infof("Starting GRPC endpoint on %s", listen)
+
 	lis, err := net.Listen("tcp", listen)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %v", listen, err)

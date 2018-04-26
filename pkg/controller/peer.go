@@ -81,3 +81,12 @@ func (p *peer) rpcStopEtcd(ctx context.Context, request *protoetcd.StopEtcdReque
 	peerClient := protoetcd.NewEtcdManagerServiceClient(peerGrpcClient)
 	return peerClient.StopEtcd(ctx, request)
 }
+
+func (p *peer) rpcUpdateState(ctx context.Context, request *protoetcd.UpdateStateRequest) (*protoetcd.UpdateStateResponse, error) {
+	peerGrpcClient, err := p.peers.GetPeerClient(p.Id)
+	if err != nil {
+		return nil, fmt.Errorf("error getting peer client %q: %v", p.Id, err)
+	}
+	peerClient := protoetcd.NewEtcdManagerServiceClient(peerGrpcClient)
+	return peerClient.UpdateState(ctx, request)
+}

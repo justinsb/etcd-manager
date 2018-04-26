@@ -36,9 +36,9 @@ func (n *TestHarnessNode) Run() {
 	ctx := n.TestHarness.Context
 
 	grpcPort := n.TestHarness.GrpcPort
-	nodeEndpoint := fmt.Sprintf("%s:%d", n.Address, grpcPort)
+	grpcEndpoint := fmt.Sprintf("%s:%d", n.Address, grpcPort)
 
-	glog.Infof("Starting node %q", nodeEndpoint)
+	glog.Infof("Starting node %q", grpcEndpoint)
 
 	uniqueID, err := privateapi.PersistentPeerId(n.NodeDir)
 	if err != nil {
@@ -49,7 +49,7 @@ func (n *TestHarnessNode) Run() {
 		ID: string(uniqueID),
 	}
 	discoMe.Endpoints = append(discoMe.Endpoints, discovery.NodeEndpoint{
-		Endpoint: nodeEndpoint,
+		Endpoint: grpcEndpoint,
 	})
 	p, err := vfs.Context.BuildVfsPath(n.TestHarness.DiscoveryStoreDir)
 	if err != nil {
@@ -60,18 +60,17 @@ func (n *TestHarnessNode) Run() {
 		glog.Fatalf("error building discovery: %v", err)
 	}
 
-	grpcAddress := fmt.Sprintf("%s:%d", nodeEndpoint, grpcPort)
 	myInfo := privateapi.PeerInfo{
 		Id:        string(uniqueID),
-		Endpoints: []string{nodeEndpoint},
+		Endpoints: []string{grpcEndpoint},
 	}
 	peerServer, err := privateapi.NewServer(ctx, myInfo, disco)
-	peerServer.PingInterval = time.Second
-	peerServer.HealthyTimeout = time.Second * 5
-	peerServer.DiscoveryPollInterval = time.Second * 5
 	if err != nil {
 		glog.Fatalf("error building server: %v", err)
 	}
+	peerServer.PingInterval = time.Second
+	peerServer.HealthyTimeout = time.Second * 5
+	peerServer.DiscoveryPollInterval = time.Second * 5
 
 	//c := &apis_etcd.EtcdNode{
 	//	DesiredClusterSize: 3,
@@ -112,7 +111,10 @@ func (n *TestHarnessNode) Run() {
 		t.Fatalf("error initializing lock: %v", err)
 	}
 
-	etcdServer := etcd.NewEtcdServer(n.NodeDir, n.TestHarness.ClusterName, me, peerServer)
+	etcdServer, err := etcd.NewEtcdServer(n.NodeDir, n.TestHarness.ClusterName, me, peerServer)
+	if err != nil {
+		t.Fatalf("error from NewEtcdServer: %v", err)
+	}
 	n.etcdServer = etcdServer
 	go etcdServer.Run(ctx)
 
@@ -124,7 +126,7 @@ func (n *TestHarnessNode) Run() {
 	n.etcdController = c
 	go c.Run(ctx)
 
-	if err := peerServer.ListenAndServe(ctx, grpcAddress); err != nil {
+	if err := peerServer.ListenAndServe(ctx, grpcEndpoint); err != nil {
 		if ctx.Done() == nil {
 			t.Fatalf("error creating private API server: %v", err)
 		}

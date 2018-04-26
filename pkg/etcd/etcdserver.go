@@ -29,9 +29,9 @@ type EtcdServer struct {
 
 	mutex sync.Mutex
 
-	state    *protoetcd.EtcdState
-	prepared *preparedState
-	process  *etcdProcess
+	nodeState *protoetcd.NodeState
+	prepared  *preparedState
+	process   *etcdProcess
 }
 
 type preparedState struct {
@@ -39,7 +39,7 @@ type preparedState struct {
 	clusterToken string
 }
 
-func NewEtcdServer(baseDir string, clusterName string, etcdNodeConfiguration *protoetcd.EtcdNode, peerServer *privateapi.Server) *EtcdServer {
+func NewEtcdServer(baseDir string, clusterName string, etcdNodeConfiguration *protoetcd.EtcdNode, peerServer *privateapi.Server) (*EtcdServer, error) {
 	s := &EtcdServer{
 		baseDir:               baseDir,
 		clusterName:           clusterName,
@@ -47,8 +47,13 @@ func NewEtcdServer(baseDir string, clusterName string, etcdNodeConfiguration *pr
 		etcdNodeConfiguration: etcdNodeConfiguration,
 	}
 
+	// Initialize before starting to serve
+	if err := s.readState(); err != nil {
+		return nil, err
+	}
+
 	protoetcd.RegisterEtcdManagerServiceServer(peerServer.GrpcServer(), s)
-	return s
+	return s, nil
 }
 
 var _ protoetcd.EtcdManagerServiceServer = &EtcdServer{}
@@ -57,12 +62,12 @@ func (s *EtcdServer) Run(ctx context.Context) {
 	contextutil.Forever(ctx, time.Second*10, func() {
 		err := s.runOnce()
 		if err != nil {
-			glog.Warningf("error running etcd: %v", err)
+			glog.Warningf("error running etcd loop: %v", err)
 		}
 	})
 }
 
-func readState(baseDir string) (*protoetcd.EtcdState, error) {
+func readState(baseDir string) (*protoetcd.NodeState, error) {
 	p := filepath.Join(baseDir, "state")
 	b, err := ioutil.ReadFile(p)
 	if err != nil {
@@ -72,7 +77,7 @@ func readState(baseDir string) (*protoetcd.EtcdState, error) {
 		return nil, fmt.Errorf("error reading state file %q: %v", p, err)
 	}
 
-	state := &protoetcd.EtcdState{}
+	state := &protoetcd.NodeState{}
 	if err := proto.Unmarshal(b, state); err != nil {
 		// TODO: Have multiple state files?
 		return nil, fmt.Errorf("error parsing state file: %v", err)
@@ -81,7 +86,17 @@ func readState(baseDir string) (*protoetcd.EtcdState, error) {
 	return state, nil
 }
 
-func writeState(baseDir string, state *protoetcd.EtcdState) error {
+// updateState writes state to disk and updates s.nodeState
+func (s *EtcdServer) updateState(nodeState *protoetcd.NodeState) error {
+	if err := writeStateToDisk(s.baseDir, nodeState); err != nil {
+		return err
+	}
+	// Note that we update the in-memory version _after_ we have successfully written to disk - we "can't" fail at this point
+	s.nodeState = nodeState
+	return nil
+}
+
+func writeStateToDisk(baseDir string, state *protoetcd.NodeState) error {
 	p := filepath.Join(baseDir, "state")
 
 	b, err := proto.Marshal(state)
@@ -95,20 +110,31 @@ func writeState(baseDir string, state *protoetcd.EtcdState) error {
 	return nil
 }
 
-func (s *EtcdServer) runOnce() error {
+func (s *EtcdServer) readState() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if s.state == nil {
-		state, err := readState(s.baseDir)
+	if s.nodeState == nil {
+		nodeState, err := readState(s.baseDir)
 		if err != nil {
 			return err
 		}
 
-		if state != nil {
-			s.state = state
+		if nodeState != nil {
+			s.nodeState = nodeState
 		}
 	}
+
+	return nil
+}
+
+func (s *EtcdServer) runOnce() error {
+	if err := s.readState(); err != nil {
+		return err
+	}
+
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
 
 	// Check that etcd process is still running
 	if s.process != nil {
@@ -121,8 +147,8 @@ func (s *EtcdServer) runOnce() error {
 	}
 
 	// Start etcd, if it is not running but should be
-	if s.state != nil && s.state.Cluster != nil && s.process == nil {
-		if err := s.startEtcdProcess(s.state); err != nil {
+	if s.nodeState != nil && s.nodeState.EtcdState != nil && s.nodeState.EtcdState.Cluster != nil && s.process == nil {
+		if err := s.startEtcdProcess(s.nodeState.EtcdState); err != nil {
 			return err
 		}
 	}
@@ -139,22 +165,33 @@ func (s *EtcdServer) GetInfo(context.Context, *protoetcd.GetInfoRequest) (*proto
 	response.ClusterName = s.clusterName
 	response.NodeConfiguration = s.etcdNodeConfiguration
 
-	if s.state != nil {
-		response.EtcdState = s.state
+	if s.nodeState != nil {
+		response.EtcdState = s.nodeState.EtcdState
+		response.ClusterSpecVersion = s.nodeState.ClusterSpecVersion
 	}
 
-	//if s.state != nil && s.state.Cluster != nil {
-	//	//pb := &protoetcd.EtcdCluster{}
-	//	//*pb = *s.state.Cluster
-	//	response.EtcdConfigured = true
-	//	response.ClusterToken = s.state.Cluster.ClusterToken
-	//	if s.state.Cluster.Me != nil {
-	//		response.NodeConfiguration = s.state.Cluster.Me
-	//	}
-	//	//response.ClusterConfiguration = pb
-	//}
-
 	return response, nil
+}
+
+// validateHeader checks that the required fields are set and match our cluster
+func (s *EtcdServer) validateHeader(header *protoetcd.CommonRequestHeader) error {
+	if header.ClusterSpec == nil {
+		glog.Infof("request was missing ClusterSpec: %s", header)
+		return fmt.Errorf("ClusterSpec missing")
+	}
+
+	if header.ClusterName != s.clusterName {
+		glog.Infof("request had incorrect ClusterName.  ClusterName=%q but request=%q", s.clusterName, header.ClusterName)
+		return fmt.Errorf("ClusterName mismatch")
+	}
+
+	if !s.peerServer.IsLeader(header.LeadershipToken) {
+		return fmt.Errorf("LeadershipToken in request %q is not current leader", header.LeadershipToken)
+	}
+
+	// TODO: Validate (our) peer id?
+
+	return nil
 }
 
 // JoinCluster requests that the node join an existing cluster
@@ -162,15 +199,8 @@ func (s *EtcdServer) JoinCluster(ctx context.Context, request *protoetcd.JoinClu
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if request.ClusterName != s.clusterName {
-		glog.Infof("request had incorrect ClusterName.  ClusterName=%q but request=%q", s.clusterName, request)
-		return nil, fmt.Errorf("ClusterName mismatch")
-	}
-
-	// TODO: Validate (our) peer id?
-
-	if !s.peerServer.IsLeader(request.LeadershipToken) {
-		return nil, fmt.Errorf("LeadershipToken in request %q is not current leader", request.LeadershipToken)
+	if err := s.validateHeader(request.Header); err != nil {
+		return nil, err
 	}
 
 	if s.prepared != nil && time.Now().After(s.prepared.validUntil) {
@@ -213,28 +243,32 @@ func (s *EtcdServer) JoinCluster(ctx context.Context, request *protoetcd.JoinClu
 			return nil, fmt.Errorf("clusterToken %q does not match prepared %q", request.ClusterToken, s.prepared.clusterToken)
 		}
 
-		if s.state == nil {
-			s.state = &protoetcd.EtcdState{}
-		}
-		s.state.NewCluster = true
-		s.state.Cluster = &protoetcd.EtcdCluster{
+		etcdState := &protoetcd.EtcdState{}
+
+		etcdState.NewCluster = true
+		etcdState.Cluster = &protoetcd.EtcdCluster{
 			ClusterToken: request.ClusterToken,
 			Nodes:        request.Nodes,
 		}
-		s.state.Quarantined = true
-		s.state.EtcdVersion = request.EtcdVersion
+		etcdState.Quarantined = true
+		etcdState.EtcdVersion = request.EtcdVersion
 
-		if err := writeState(s.baseDir, s.state); err != nil {
+		nodeState := &protoetcd.NodeState{
+			ClusterSpecVersion: request.Header.ClusterSpec,
+			EtcdState:          etcdState,
+		}
+
+		if err := s.updateState(nodeState); err != nil {
 			return nil, err
 		}
 
-		if err := s.startEtcdProcess(s.state); err != nil {
+		if err := s.startEtcdProcess(nodeState.EtcdState); err != nil {
 			return nil, err
 		}
 
 		// TODO: Wait for etcd initialization before marking as existing?
-		s.state.NewCluster = false
-		if err := writeState(s.baseDir, s.state); err != nil {
+		nodeState.EtcdState.NewCluster = false
+		if err := s.updateState(nodeState); err != nil {
 			return nil, err
 		}
 		s.prepared = nil
@@ -252,22 +286,26 @@ func (s *EtcdServer) JoinCluster(ctx context.Context, request *protoetcd.JoinClu
 			return nil, fmt.Errorf("clusterToken %q does not match prepared %q", request.ClusterToken, s.prepared.clusterToken)
 		}
 
-		if s.state == nil {
-			s.state = &protoetcd.EtcdState{}
-		}
-		s.state.NewCluster = false
-		s.state.Cluster = &protoetcd.EtcdCluster{
+		etcdState := &protoetcd.EtcdState{}
+
+		etcdState.NewCluster = false
+		etcdState.Cluster = &protoetcd.EtcdCluster{
 			ClusterToken: request.ClusterToken,
 			Nodes:        request.Nodes,
 		}
-		s.state.Quarantined = false
-		s.state.EtcdVersion = request.EtcdVersion
+		etcdState.Quarantined = false
+		etcdState.EtcdVersion = request.EtcdVersion
 
-		if err := writeState(s.baseDir, s.state); err != nil {
+		nodeState := &protoetcd.NodeState{
+			ClusterSpecVersion: request.Header.ClusterSpec,
+			EtcdState:          etcdState,
+		}
+
+		if err := s.updateState(nodeState); err != nil {
 			return nil, err
 		}
 
-		if err := s.startEtcdProcess(s.state); err != nil {
+		if err := s.startEtcdProcess(nodeState.EtcdState); err != nil {
 			return nil, err
 		}
 		// TODO: Wait for join?
@@ -286,25 +324,18 @@ func (s *EtcdServer) Reconfigure(ctx context.Context, request *protoetcd.Reconfi
 
 	glog.Infof("Reconfigure request: %v", request)
 
-	if request.ClusterName != s.clusterName {
-		glog.Infof("request had incorrect ClusterName.  ClusterName=%q but request=%q", s.clusterName, request)
-		return nil, fmt.Errorf("ClusterName mismatch")
+	if err := s.validateHeader(request.Header); err != nil {
+		return nil, err
 	}
 
-	// TODO: Validate (our) peer id?
-
-	if !s.peerServer.IsLeader(request.LeadershipToken) {
-		return nil, fmt.Errorf("LeadershipToken in request %q is not current leader", request.LeadershipToken)
-	}
-
-	if s.state == nil {
+	if s.nodeState == nil || s.nodeState.EtcdState == nil {
 		return nil, fmt.Errorf("cluster not running")
 	}
 
 	response := &protoetcd.ReconfigureResponse{}
 
-	state := proto.Clone(s.state).(*protoetcd.EtcdState)
-	me, err := s.findSelfNode(state)
+	newState := proto.Clone(s.nodeState).(*protoetcd.NodeState)
+	me, err := s.findSelfNode(newState.EtcdState)
 	if err != nil {
 		return nil, err
 	}
@@ -323,10 +354,11 @@ func (s *EtcdServer) Reconfigure(ctx context.Context, request *protoetcd.Reconfi
 			return nil, fmt.Errorf("etcd version %q not supported", request.EtcdVersion)
 		}
 
-		state.EtcdVersion = request.EtcdVersion
+		newState.EtcdState.EtcdVersion = request.EtcdVersion
 	}
 
-	state.Quarantined = request.Quarantined
+	newState.EtcdState.Quarantined = request.Quarantined
+	newState.ClusterSpecVersion = request.Header.ClusterSpec
 
 	glog.Infof("Stopping etcd for reconfigure request: %v", request)
 	_, err = s.stopEtcdProcess()
@@ -334,13 +366,11 @@ func (s *EtcdServer) Reconfigure(ctx context.Context, request *protoetcd.Reconfi
 		return nil, fmt.Errorf("error stoppping etcd process: %v", err)
 	}
 
-	s.state = state
-	if err := writeState(s.baseDir, s.state); err != nil {
+	if err := s.updateState(newState); err != nil {
 		return nil, err
 	}
 
-	glog.Infof("Starting etcd version %q", s.state.EtcdVersion)
-	if err := s.startEtcdProcess(s.state); err != nil {
+	if err := s.startEtcdProcess(s.nodeState.EtcdState); err != nil {
 		return nil, err
 	}
 
@@ -354,18 +384,11 @@ func (s *EtcdServer) StopEtcd(ctx context.Context, request *protoetcd.StopEtcdRe
 
 	glog.Infof("StopEtcd request: %v", request)
 
-	if request.ClusterName != s.clusterName {
-		glog.Infof("request had incorrect ClusterName.  ClusterName=%q but request=%q", s.clusterName, request)
-		return nil, fmt.Errorf("ClusterName mismatch")
+	if err := s.validateHeader(request.Header); err != nil {
+		return nil, err
 	}
 
-	// TODO: Validate (our) peer id?
-
-	if !s.peerServer.IsLeader(request.LeadershipToken) {
-		return nil, fmt.Errorf("LeadershipToken in request %q is not current leader", request.LeadershipToken)
-	}
-
-	if s.state == nil {
+	if s.nodeState == nil || s.nodeState.EtcdState == nil {
 		return nil, fmt.Errorf("cluster not running")
 	}
 
@@ -373,14 +396,39 @@ func (s *EtcdServer) StopEtcd(ctx context.Context, request *protoetcd.StopEtcdRe
 
 	glog.Infof("Stopping etcd for stop request: %v", request)
 	if _, err := s.stopEtcdProcess(); err != nil {
-		return nil, fmt.Errorf("error stoppping etcd process: %v", err)
+		return nil, fmt.Errorf("error stopping etcd process: %v", err)
 	}
 
-	state := &protoetcd.EtcdState{}
-	s.state = state
-	if err := writeState(s.baseDir, s.state); err != nil {
+	newState := &protoetcd.NodeState{
+		ClusterSpecVersion: request.Header.ClusterSpec,
+	}
+
+	if err := s.updateState(newState); err != nil {
 		return nil, err
 	}
+
+	return response, nil
+}
+
+// UpdateState stores the server-provided state on persistent storage
+func (s *EtcdServer) UpdateState(ctx context.Context, request *protoetcd.UpdateStateRequest) (*protoetcd.UpdateStateResponse, error) {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	glog.Infof("UpdateState request: %v", request)
+
+	if err := s.validateHeader(request.Header); err != nil {
+		return nil, err
+	}
+
+	newState := proto.Clone(s.nodeState).(*protoetcd.NodeState)
+	newState.ClusterSpecVersion = request.Header.ClusterSpec
+
+	if err := s.updateState(newState); err != nil {
+		return nil, err
+	}
+
+	response := &protoetcd.UpdateStateResponse{}
 
 	return response, nil
 }
@@ -390,13 +438,8 @@ func (s *EtcdServer) DoBackup(ctx context.Context, request *protoetcd.DoBackupRe
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if s.clusterName != request.ClusterName {
-		glog.Infof("request had incorrect ClusterName.  ClusterName=%q but request=%q", s.clusterName, request)
-		return nil, fmt.Errorf("ClusterName mismatch")
-	}
-
-	if !s.peerServer.IsLeader(request.LeadershipToken) {
-		return nil, fmt.Errorf("LeadershipToken in request %q is not current leader", request.LeadershipToken)
+	if err := s.validateHeader(request.Header); err != nil {
+		return nil, err
 	}
 
 	if s.process == nil {
@@ -409,6 +452,16 @@ func (s *EtcdServer) DoBackup(ctx context.Context, request *protoetcd.DoBackupRe
 	if request.Info == nil {
 		return nil, fmt.Errorf("Info is required")
 	}
+
+	{
+		// TODO: Make this optional?
+		newState := proto.Clone(s.nodeState).(*protoetcd.NodeState)
+		newState.ClusterSpecVersion = request.Header.ClusterSpec
+		if err := s.updateState(newState); err != nil {
+			return nil, err
+		}
+	}
+
 	backupStore, err := backup.NewStore(request.Storage)
 	if err != nil {
 		return nil, err
@@ -451,7 +504,7 @@ func (s *EtcdServer) startEtcdProcess(state *protoetcd.EtcdState) error {
 		return fmt.Errorf("ClusterToken not configured, cannot start etcd")
 	}
 	dataDir := filepath.Join(s.baseDir, "data", state.Cluster.ClusterToken)
-	glog.Infof("starting etcd with datadir %s", dataDir)
+	glog.Infof("starting etcd %s with datadir %s", state.EtcdVersion, dataDir)
 
 	// TODO: Validate this during the PREPARE phase
 	meNode, err := s.findSelfNode(state)
@@ -493,7 +546,7 @@ func (s *EtcdServer) startEtcdProcess(state *protoetcd.EtcdState) error {
 	return nil
 }
 
-// StopEtcdProcess terminates etcd if it is running; primarily used for testing
+// StopEtcdProcessForTest terminates etcd if it is running; primarily used for testing
 func (s *EtcdServer) StopEtcdProcessForTest() (bool, error) {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
@@ -501,7 +554,7 @@ func (s *EtcdServer) StopEtcdProcessForTest() (bool, error) {
 	return s.stopEtcdProcess()
 }
 
-// stopEtcdProcess terminates etcd if it is running.  This version assumes the lock is held (unlike StopEtcdProcess)
+// stopEtcdProcess terminates etcd if it is running.  This version assumes the lock is held (unlike StopEtcdProcessForTest)
 func (s *EtcdServer) stopEtcdProcess() (bool, error) {
 	if s.process == nil {
 		return false, nil

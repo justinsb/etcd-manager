@@ -42,6 +42,9 @@ type EtcdController struct {
 	leadership *leadershipState
 	peerState  map[privateapi.PeerId]*peerState
 
+	clusterSpecVersion *protoetcd.ClusterSpecVersion
+	clusterSpec        *protoetcd.ClusterSpec
+
 	// CycleInterval is the time to wait in between iterations of the state synchronization loop, when no progress has been made previously
 	CycleInterval time.Duration
 
@@ -94,6 +97,10 @@ func (m *EtcdController) Run(ctx context.Context) {
 
 func (m *EtcdController) run(ctx context.Context) (bool, error) {
 	glog.Infof("starting controller iteration")
+
+	// Zero these out - we want to discover them every iteration
+	m.clusterSpecVersion = nil
+	m.clusterSpec = nil
 
 	// Get all (responsive) peers in the discovery cluster
 	var peers []*peer
@@ -166,7 +173,7 @@ func (m *EtcdController) run(ctx context.Context) (bool, error) {
 		m.peerState = make(map[privateapi.PeerId]*peerState)
 
 		// Wait one cycle after a new leader election
-		return true, nil
+		return false, nil
 	}
 
 	// Check that all peers have acked the leader
@@ -177,7 +184,7 @@ func (m *EtcdController) run(ctx context.Context) (bool, error) {
 				m.leadership = nil
 
 				// Wait one cycle after leadership changes
-				return true, nil
+				return false, nil
 			}
 		}
 	}
@@ -196,7 +203,7 @@ func (m *EtcdController) run(ctx context.Context) (bool, error) {
 		ps := m.peerState[privateapi.PeerId(id)]
 		if ps == nil {
 			ps = &peerState{
-				lastEtcdHealthy: now, // We mark it as healthy, so we always wait before removing it
+				lastEtcdHealthy: now, // We start it as healthy, so we always wait before removing it
 			}
 			m.peerState[privateapi.PeerId(id)] = ps
 		}
@@ -205,8 +212,9 @@ func (m *EtcdController) run(ctx context.Context) (bool, error) {
 		}
 	}
 
-	// Number of peers that are configured as part of this cluster
+	// Number of peers that are configured to run etcd
 	configuredMembers := 0
+	// Number of peers that are configured to run etcd in quarantined state (a subset of configuredMembers)
 	quarantinedMembers := 0
 	for _, peer := range clusterState.peers {
 		if peer.info == nil {
@@ -226,38 +234,109 @@ func (m *EtcdController) run(ctx context.Context) (bool, error) {
 	}
 
 	// Determine what our desired state is
-	clusterSpec, err := m.loadClusterSpec(ctx, clusterState, configuredMembers != 0)
-	if clusterSpec == nil {
-		glog.Infof("no cluster spec set - must seed new cluster")
-		return false, nil
-	}
-	if err != nil {
+	if err := m.loadClusterSpec(ctx, clusterState); err != nil {
 		return false, fmt.Errorf("error fetching cluster spec: %v", err)
 	}
-	glog.Infof("spec %v", clusterSpec)
 
-	//if len(clusterState.Running)  == 0 {
-	//	glog.Warningf("No running etcd pods")
-	//	// TODO: Recover from backup; if no backup seed backup
-	//}
+	if m.clusterSpec == nil {
+		// {
+		// 	var info *protoetcd.BackupInfo
 
-	if configuredMembers == 0 {
-		return m.createNewCluster(ctx, clusterSpec, clusterState)
+		// 	backups, err := m.backupStore.ListBackups()
+		// 	if err != nil {
+		// 		return nil, fmt.Errorf("error listing backups: %v", err)
+		// 	}
+		// 	glog.Infof("found %d backups", len(backups))
+
+		// 	for i := len(backups) - 1; i >= 0; i-- {
+		// 		backup := backups[i]
+
+		// 		info, err = m.backupStore.LoadInfo(backup)
+		// 		if err != nil {
+		// 			glog.Warningf("error reading cluster state in %q: %v", backup, err)
+		// 			continue
+		// 		}
+		// 		if info == nil || info.ClusterSpec == nil {
+		// 			glog.Warningf("cluster state not found in %q", backup)
+		// 			continue
+		// 		} else {
+		// 			break
+		// 		}
+		// 	}
+
+		// 	if info != nil && info.ClusterSpec != nil {
+		// 		if etcdIsRunning {
+		// 			glog.Infof("copying cluster spec into etcd: %v", info.ClusterSpec)
+		// 			err = m.writeClusterSpec(ctx, etcdClusterState, info.ClusterSpec)
+		// 			if err != nil {
+		// 				// Concurrent leader wrote this?
+		// 				return nil, err
+		// 			}
+		// 		}
+
+		// 		glog.Infof("read cluster spec from backup: %v", info.ClusterSpec)
+		// 		return info.ClusterSpec, nil
+		// 	}
+		// }
+
+		if configuredMembers == 0 {
+			glog.Infof("no running etcd cluster members, looking for bootstrap command")
+
+			commands, err := m.backupStore.ListCommands()
+			if err != nil {
+				return false, err
+			}
+
+			var createNewCluster *backup.Command
+			for _, command := range commands {
+				if command.Data.Timestamp == 0 {
+					glog.Infof("command did not have timestamp; ignoring %v", command)
+					continue
+				}
+
+				if command.Data.CreateNewCluster != nil {
+					createNewCluster = command
+				}
+			}
+
+			if createNewCluster == nil {
+				glog.Infof("no command found to start new cluster - must seed new cluster")
+				return false, nil
+			}
+
+			m.clusterSpecVersion = &protoetcd.ClusterSpecVersion{
+				ClusterSpec: createNewCluster.Data.CreateNewCluster,
+				Timestamp:   createNewCluster.Data.Timestamp,
+			}
+			m.clusterSpec = m.clusterSpecVersion.ClusterSpec
+
+			return m.createInitialCluster(ctx, clusterState)
+		} else {
+			glog.Infof("some peers running etcd, but unable to read current state")
+			return false, nil
+		}
 	}
 
+	glog.Infof("cluster spec %v", m.clusterSpec)
+
+	if configuredMembers == 0 && m.clusterSpec.RestoreBackup != "" {
+		return m.createInitialCluster(ctx, clusterState)
+	}
+
+	// TODO: We need enough members for quorum
 	if quarantinedMembers > 0 {
-		return m.restoreBackupAndLiftQuarantine(ctx, clusterSpec, clusterState)
+		return m.restoreBackupAndLiftQuarantine(ctx, clusterState, m.clusterSpec.RestoreBackup)
 	}
 
 	if len(clusterState.members) != 0 {
-		if err := m.maybeBackup(ctx, clusterSpec, clusterState); err != nil {
+		if err := m.maybeBackup(ctx, clusterState); err != nil {
 			glog.Warningf("error during backup: %v", err)
 		}
 	}
 
-	if len(clusterState.members) < int(clusterSpec.MemberCount) {
-		glog.Infof("etcd has %d members registered, we want %d; will try to expand cluster", len(clusterState.members), clusterSpec.MemberCount)
-		return m.addNodeToCluster(ctx, clusterSpec, clusterState)
+	if len(clusterState.members) < int(m.clusterSpec.MemberCount) {
+		glog.Infof("etcd has %d members registered, we want %d; will try to expand cluster", len(clusterState.members), m.clusterSpec.MemberCount)
+		return m.addNodeToCluster(ctx, clusterState)
 	}
 
 	if len(clusterState.members) == 0 {
@@ -265,8 +344,8 @@ func (m *EtcdController) run(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 
-	if configuredMembers > int(clusterSpec.MemberCount) {
-		return m.removeNodeFromCluster(ctx, clusterSpec, clusterState, true)
+	if configuredMembers > int(m.clusterSpec.MemberCount) {
+		return m.removeNodeFromCluster(ctx, clusterState, true)
 	}
 
 	// healthy members
@@ -274,21 +353,21 @@ func (m *EtcdController) run(ctx context.Context) (bool, error) {
 		glog.Infof("etcd has unhealthy members")
 		// TODO: Wait longer in case of a flake
 		// TODO: Still backup before mutating the cluster
-		return m.removeNodeFromCluster(ctx, clusterSpec, clusterState, false)
+		return m.removeNodeFromCluster(ctx, clusterState, false)
 	}
 
 	// Check if the cluster is not of the desired version
 	{
 		var versionMismatch []*etcdClusterPeerInfo
 		for _, peer := range clusterState.peers {
-			if peer.info != nil && peer.info.EtcdState != nil && peer.info.EtcdState.EtcdVersion != clusterSpec.EtcdVersion {
-				glog.Infof("mismatched version for peer %v: want %q, have %q", peer.peer, clusterSpec.EtcdVersion, peer.info.EtcdState.EtcdVersion)
+			if peer.info != nil && peer.info.EtcdState != nil && peer.info.EtcdState.EtcdVersion != m.clusterSpec.EtcdVersion {
+				glog.Infof("mismatched version for peer %v: want %q, have %q", peer.peer, m.clusterSpec.EtcdVersion, peer.info.EtcdState.EtcdVersion)
 				versionMismatch = append(versionMismatch, peer)
 			}
 		}
 
 		if len(versionMismatch) != 0 {
-			return m.stopForUpgrade(ctx, clusterSpec, clusterState)
+			return m.stopForUpgrade(ctx, clusterState)
 		}
 	}
 
@@ -297,7 +376,7 @@ func (m *EtcdController) run(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-func (m *EtcdController) maybeBackup(ctx context.Context, clusterSpec *protoetcd.ClusterSpec, clusterState *etcdClusterState) error {
+func (m *EtcdController) maybeBackup(ctx context.Context, clusterState *etcdClusterState) error {
 	now := time.Now()
 
 	backupInterval := 5 * time.Minute
@@ -307,7 +386,7 @@ func (m *EtcdController) maybeBackup(ctx context.Context, clusterSpec *protoetcd
 		return nil
 	}
 
-	backup, err := m.doClusterBackup(ctx, clusterSpec, clusterState)
+	backup, err := m.doClusterBackup(ctx, clusterState)
 	if err != nil {
 		return err
 	}
@@ -322,93 +401,157 @@ func (m *EtcdController) maybeBackup(ctx context.Context, clusterSpec *protoetcd
 	return nil
 }
 
-// writeClusterSpec writes the cluster spec to etcd
-func (m *EtcdController) writeClusterSpec(ctx context.Context, etcdClusterState *etcdClusterState, clusterSpec *protoetcd.ClusterSpec) error {
+// writeClusterSpec writes the cluster spec
+func (m *EtcdController) writeClusterSpec(ctx context.Context, etcdClusterState *etcdClusterState, newClusterSpecVersion *protoetcd.ClusterSpecVersion) error {
+	// TODO: Be lazy and only change if the ClusterSpec (without the timestamp!) has in fact changed?
+
+	// Sanity check
+	memberToPeer := make(map[EtcdMemberId]*peer)
+	for memberId, member := range etcdClusterState.members {
+		found := false
+		for _, p := range etcdClusterState.peers {
+			if p.info == nil || p.info.NodeConfiguration == nil || p.peer == nil {
+				continue
+			}
+			if p.info.NodeConfiguration.Name == string(member.Name) {
+				memberToPeer[memberId] = p.peer
+				found = true
+			}
+		}
+		if !found {
+			return fmt.Errorf("unable to find peer for %q", member.Name)
+		}
+	}
+
+	// Write to etcd
 	key := "/kope.io/etcd-manager/" + m.clusterName + "/spec"
-	data, err := protoetcd.ToJson(clusterSpec)
+	data, err := protoetcd.ToJson(newClusterSpecVersion.ClusterSpec)
 	if err != nil {
 		return fmt.Errorf("error serializing cluster spec: %v", err)
 	}
 
-	err = etcdClusterState.etcdCreate(ctx, key, []byte(data))
+	err = etcdClusterState.etcdPut(ctx, key, []byte(data))
 	if err != nil {
 		// Concurrent leader wrote this?
 		return fmt.Errorf("error writing cluster spec back to etcd: %v", err)
 	}
 
+	// We update the local copy before we write to the replicas; as we take the latest we treat ourselves as a replica
+	m.clusterSpecVersion = newClusterSpecVersion
+	m.clusterSpec = newClusterSpecVersion.ClusterSpec
+
+	for memberId := range etcdClusterState.members {
+		peer := memberToPeer[memberId]
+		if peer == nil {
+			// We checked this when we built the map
+			panic("peer unexpectedly not found - logic error")
+		}
+
+		request := &protoetcd.UpdateStateRequest{
+			Header: m.buildHeader(),
+		}
+		response, err := peer.rpcUpdateState(ctx, request)
+		if err != nil {
+			return fmt.Errorf("error writing state to peer %q: %v", peer.Id, err)
+		}
+		glog.Infof("wrote state to peer %q: %v", peer.Id, response)
+	}
+
 	return nil
 }
 
-// loadClusterSpec tries to load the desired cluster spec.
-// We try to load first from etcd, then from the most recent backup, and then from InitialClusterSpecProvider
-func (m *EtcdController) loadClusterSpec(ctx context.Context, etcdClusterState *etcdClusterState, etcdIsRunning bool) (*protoetcd.ClusterSpec, error) {
+// loadClusterSpec tries to load the desired cluster spec from etcd, and falls back to the cluster state
+func (m *EtcdController) loadClusterSpec(ctx context.Context, etcdClusterState *etcdClusterState) error {
 	key := "/kope.io/etcd-manager/" + m.clusterName + "/spec"
 	if len(etcdClusterState.members) > 0 {
 		b, err := etcdClusterState.etcdGet(ctx, key)
 		if err != nil {
-			return nil, fmt.Errorf("unable to load cluster spec from cluster - no members")
+			return fmt.Errorf("unable to load cluster spec from cluster - no members")
 		}
 
 		if b != nil {
 			spec := &protoetcd.ClusterSpec{}
 			err := protoetcd.FromJson(string(b), spec)
 			if err != nil {
-				return nil, fmt.Errorf("error parsing cluster spec from etcd %q: %v", key, err)
+				return fmt.Errorf("error parsing cluster spec from etcd %q: %v", key, err)
 			}
 			glog.Infof("Loaded cluster spec from etcd: %v", spec)
-			return spec, nil
+			clusterSpecVersion := &protoetcd.ClusterSpecVersion{
+				ClusterSpec: spec,
+				Timestamp:   time.Now().UnixNano(),
+			}
+			glog.Errorf("Timestamp is not the correct approach for cluster spec sequencing")
+			m.clusterSpecVersion = clusterSpecVersion
+			m.clusterSpec = clusterSpecVersion.ClusterSpec
+			return nil
 		}
 
-		// This is the case for bootstrapping, but generally if the key isn't set we want to get it from the backup store
-		glog.Infof("spec key not set, will bootstrap from backup")
-	} else if etcdIsRunning {
-		return nil, fmt.Errorf("unable to load cluster spec from cluster - no members")
+		glog.Infof("unable to read cluster spec from any etcd member")
 	} else {
-		glog.Infof("no etcd cluster members - restoring from backup")
+		glog.Infof("no running etcd cluster members - cannot get cluster spec from etcd")
 	}
 
-	{
-		var info *protoetcd.BackupInfo
-
-		backups, err := m.backupStore.ListBackups()
-		if err != nil {
-			return nil, fmt.Errorf("error listing backups: %v", err)
-		}
-		glog.Infof("found %d backups", len(backups))
-
-		for i := len(backups) - 1; i >= 0; i-- {
-			backup := backups[i]
-
-			info, err = m.backupStore.LoadInfo(backup)
-			if err != nil {
-				glog.Warningf("error reading cluster state in %q: %v", backup, err)
-				continue
-			}
-			if info == nil || info.ClusterSpec == nil {
-				glog.Warningf("cluster state not found in %q", backup)
-				continue
-			} else {
-				break
-			}
+	var newest *protoetcd.ClusterSpecVersion
+	for _, peer := range etcdClusterState.peers {
+		if peer.info == nil || peer.info.ClusterSpecVersion == nil {
+			continue
 		}
 
-		if info != nil && info.ClusterSpec != nil {
-			if etcdIsRunning {
-				glog.Infof("copying cluster spec into etcd: %v", info.ClusterSpec)
-				err = m.writeClusterSpec(ctx, etcdClusterState, info.ClusterSpec)
-				if err != nil {
-					// Concurrent leader wrote this?
-					return nil, err
-				}
-			}
-
-			glog.Infof("read cluster spec from backup: %v", info.ClusterSpec)
-			return info.ClusterSpec, nil
+		if newest == nil || peer.info.ClusterSpecVersion.Timestamp > newest.Timestamp {
+			newest = peer.info.ClusterSpecVersion
 		}
 	}
 
-	// TODO: Source from etcd cluster state, if running
-	return nil, nil
+	if newest != nil {
+		glog.Infof("Loading cluster spec from peer state: %v", newest)
+		m.clusterSpecVersion = newest
+		m.clusterSpec = newest.ClusterSpec
+		return nil
+	} else {
+		glog.Infof("No running peers had cluster spec")
+		return nil
+	}
+
+	// {
+	// 	var info *protoetcd.BackupInfo
+
+	// 	backups, err := m.backupStore.ListBackups()
+	// 	if err != nil {
+	// 		return nil, fmt.Errorf("error listing backups: %v", err)
+	// 	}
+	// 	glog.Infof("found %d backups", len(backups))
+
+	// 	for i := len(backups) - 1; i >= 0; i-- {
+	// 		backup := backups[i]
+
+	// 		info, err = m.backupStore.LoadInfo(backup)
+	// 		if err != nil {
+	// 			glog.Warningf("error reading cluster state in %q: %v", backup, err)
+	// 			continue
+	// 		}
+	// 		if info == nil || info.ClusterSpec == nil {
+	// 			glog.Warningf("cluster state not found in %q", backup)
+	// 			continue
+	// 		} else {
+	// 			break
+	// 		}
+	// 	}
+
+	// 	if info != nil && info.ClusterSpec != nil {
+	// 		if etcdIsRunning {
+	// 			glog.Infof("copying cluster spec into etcd: %v", info.ClusterSpec)
+	// 			err = m.writeClusterSpec(ctx, etcdClusterState, info.ClusterSpec)
+	// 			if err != nil {
+	// 				// Concurrent leader wrote this?
+	// 				return nil, err
+	// 			}
+	// 		}
+
+	// 		glog.Infof("read cluster spec from backup: %v", info.ClusterSpec)
+	// 		return info.ClusterSpec, nil
+	// 	}
+	// }
+
 }
 
 func randomToken() string {
@@ -510,7 +653,15 @@ func (m *EtcdController) updateClusterState(ctx context.Context, peers []*peer) 
 	return clusterState, nil
 }
 
-func (m *EtcdController) addNodeToCluster(ctx context.Context, clusterSpec *protoetcd.ClusterSpec, clusterState *etcdClusterState) (bool, error) {
+func (m *EtcdController) buildHeader() *protoetcd.CommonRequestHeader {
+	header := &protoetcd.CommonRequestHeader{
+		LeadershipToken: m.leadership.token,
+		ClusterName:     m.clusterName,
+		ClusterSpec:     m.clusterSpecVersion,
+	}
+	return header
+}
+func (m *EtcdController) addNodeToCluster(ctx context.Context, clusterState *etcdClusterState) (bool, error) {
 	var peersMissingFromEtcd []*etcdClusterPeerInfo
 	var idlePeers []*etcdClusterPeerInfo
 	for _, peer := range clusterState.peers {
@@ -532,7 +683,7 @@ func (m *EtcdController) addNodeToCluster(ctx context.Context, clusterSpec *prot
 	// We need to start etcd on a new node
 	if len(idlePeers) != 0 {
 		// Force a backup first
-		if _, err := m.doClusterBackup(ctx, clusterSpec, clusterState); err != nil {
+		if _, err := m.doClusterBackup(ctx, clusterState); err != nil {
 			return false, fmt.Errorf("failed to backup (before adding peer): %v", err)
 		}
 
@@ -569,12 +720,11 @@ func (m *EtcdController) addNodeToCluster(ctx context.Context, clusterSpec *prot
 
 		{
 			joinClusterRequest := &protoetcd.JoinClusterRequest{
-				LeadershipToken: m.leadership.token,
-				Phase:           protoetcd.Phase_PHASE_PREPARE,
-				ClusterName:     m.clusterName,
-				ClusterToken:    clusterToken,
-				EtcdVersion:     etcdVersion,
-				Nodes:           nodes,
+				Header:       m.buildHeader(),
+				Phase:        protoetcd.Phase_PHASE_PREPARE,
+				ClusterToken: clusterToken,
+				EtcdVersion:  etcdVersion,
+				Nodes:        nodes,
 			}
 
 			joinClusterResponse, err := peer.peer.rpcJoinCluster(ctx, joinClusterRequest)
@@ -595,12 +745,11 @@ func (m *EtcdController) addNodeToCluster(ctx context.Context, clusterSpec *prot
 
 		{
 			joinClusterRequest := &protoetcd.JoinClusterRequest{
-				LeadershipToken: m.leadership.token,
-				Phase:           protoetcd.Phase_PHASE_JOIN_EXISTING,
-				ClusterName:     m.clusterName,
-				ClusterToken:    clusterToken,
-				EtcdVersion:     etcdVersion,
-				Nodes:           nodes,
+				Header:       m.buildHeader(),
+				Phase:        protoetcd.Phase_PHASE_JOIN_EXISTING,
+				ClusterToken: clusterToken,
+				EtcdVersion:  etcdVersion,
+				Nodes:        nodes,
 			}
 
 			joinClusterResponse, err := peer.peer.rpcJoinCluster(ctx, joinClusterRequest)
@@ -619,7 +768,7 @@ func (m *EtcdController) addNodeToCluster(ctx context.Context, clusterSpec *prot
 }
 
 // doClusterBackup triggers a backup of etcd, on any healthy cluster member
-func (m *EtcdController) doClusterBackup(ctx context.Context, clusterSpec *protoetcd.ClusterSpec, clusterState *etcdClusterState) (*protoetcd.DoBackupResponse, error) {
+func (m *EtcdController) doClusterBackup(ctx context.Context, clusterState *etcdClusterState) (*protoetcd.DoBackupResponse, error) {
 	for _, member := range clusterState.healthyMembers {
 		peer := clusterState.FindPeer(member)
 		if peer == nil {
@@ -628,13 +777,12 @@ func (m *EtcdController) doClusterBackup(ctx context.Context, clusterSpec *proto
 		}
 
 		info := &protoetcd.BackupInfo{
-			ClusterSpec: clusterSpec,
+			ClusterSpec: m.clusterSpec,
 		}
 		doBackupRequest := &protoetcd.DoBackupRequest{
-			LeadershipToken: m.leadership.token,
-			ClusterName:     m.clusterName,
-			Storage:         m.backupStore.Spec(),
-			Info:            info,
+			Header:  m.buildHeader(),
+			Storage: m.backupStore.Spec(),
+			Info:    info,
 		}
 
 		doBackupResponse, err := peer.peer.rpcDoBackup(ctx, doBackupRequest)
@@ -649,7 +797,7 @@ func (m *EtcdController) doClusterBackup(ctx context.Context, clusterSpec *proto
 	return nil, fmt.Errorf("no peer was able to perform a backup")
 }
 
-func (m *EtcdController) removeNodeFromCluster(ctx context.Context, clusterSpec *protoetcd.ClusterSpec, clusterState *etcdClusterState, removeHealthy bool) (bool, error) {
+func (m *EtcdController) removeNodeFromCluster(ctx context.Context, clusterState *etcdClusterState, removeHealthy bool) (bool, error) {
 	// TODO: Sanity checks that we aren't about to break the cluster
 
 	var victim *etcdclient.EtcdProcessMember
@@ -712,7 +860,8 @@ func (m *EtcdController) removeNodeFromCluster(ctx context.Context, clusterSpec 
 	//}
 
 	// Force a backup first
-	if _, err := m.doClusterBackup(ctx, clusterSpec, clusterState); err != nil {
+	glog.Infof("backing up, before removing node from etcd cluster: %v", victim)
+	if _, err := m.doClusterBackup(ctx, clusterState); err != nil {
 		return false, fmt.Errorf("failed to backup (before adding peer): %v", err)
 	}
 
@@ -738,8 +887,8 @@ func quorumSize(desiredMemberCount int) int {
 
 // createNewCluster starts a new etcd cluster.
 // It tries to identify a quorum of nodes, and if found will instruct each to join the cluster.
-func (m *EtcdController) createNewCluster(ctx context.Context, clusterSpec *protoetcd.ClusterSpec, clusterState *etcdClusterState) (bool, error) {
-	desiredMemberCount := int(clusterSpec.MemberCount)
+func (m *EtcdController) createInitialCluster(ctx context.Context, clusterState *etcdClusterState) (bool, error) {
+	desiredMemberCount := int(m.clusterSpec.MemberCount)
 	desiredQuorumSize := quorumSize(desiredMemberCount)
 
 	if len(clusterState.peers) < desiredQuorumSize {
@@ -785,12 +934,11 @@ func (m *EtcdController) createNewCluster(ctx context.Context, clusterSpec *prot
 	for _, p := range proposal {
 		// Note the we may send the message to ourselves
 		joinClusterRequest := &protoetcd.JoinClusterRequest{
-			LeadershipToken: m.leadership.token,
+			Header: m.buildHeader(),
 
 			Phase:        protoetcd.Phase_PHASE_PREPARE,
-			ClusterName:  m.clusterName,
 			ClusterToken: clusterToken,
-			EtcdVersion:  clusterSpec.EtcdVersion,
+			EtcdVersion:  m.clusterSpec.EtcdVersion,
 			Nodes:        proposedNodes,
 		}
 
@@ -805,12 +953,11 @@ func (m *EtcdController) createNewCluster(ctx context.Context, clusterSpec *prot
 	for _, p := range proposal {
 		// Note the we may send the message to ourselves
 		joinClusterRequest := &protoetcd.JoinClusterRequest{
-			LeadershipToken: m.leadership.token,
+			Header: m.buildHeader(),
 
 			Phase:        protoetcd.Phase_PHASE_INITIAL_CLUSTER,
-			ClusterName:  m.clusterName,
 			ClusterToken: clusterToken,
-			EtcdVersion:  clusterSpec.EtcdVersion,
+			EtcdVersion:  m.clusterSpec.EtcdVersion,
 			Nodes:        proposedNodes,
 		}
 
@@ -821,6 +968,22 @@ func (m *EtcdController) createNewCluster(ctx context.Context, clusterSpec *prot
 		}
 		glog.V(2).Infof("JoinClusterResponse: %s", joinClusterResponse)
 	}
+
+	// for {
+	// 	if info != nil && info.ClusterSpec != nil {
+	// 		if etcdIsRunning {
+	// 			glog.Infof("copying cluster spec into etcd: %v", info.ClusterSpec)
+	// 			err = m.writeClusterSpec(ctx, etcdClusterState, info.ClusterSpec)
+	// 			if err != nil {
+	// 				// Concurrent leader wrote this?
+	// 				return nil, err
+	// 			}
+	// 		}
+
+	// 		glog.Infof("read cluster spec from backup: %v", info.ClusterSpec)
+	// 		return info.ClusterSpec, nil
+	// 	}
+	// }
 
 	// We pause to allow etcd to start - avoids us incurring a backoff delay
 	time.Sleep(2 * time.Second)

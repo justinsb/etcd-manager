@@ -223,7 +223,10 @@ func RunEtcdManager(o *EtcdManagerOptions) error {
 		return fmt.Errorf("error initializing backup store: %v", err)
 	}
 
-	etcdServer := etcd.NewEtcdServer(o.DataDir, o.ClusterName, etcdNodeInfo, peerServer)
+	etcdServer, err := etcd.NewEtcdServer(o.DataDir, o.ClusterName, etcdNodeInfo, peerServer)
+	if err != nil {
+		return fmt.Errorf("error initializing etcd server: %v", err)
+	}
 	go etcdServer.Run(ctx)
 
 	var leaderLock locking.Lock // nil

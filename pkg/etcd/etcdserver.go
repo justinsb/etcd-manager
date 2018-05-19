@@ -14,6 +14,7 @@ import (
 	protoetcd "kope.io/etcd-manager/pkg/apis/etcd"
 	"kope.io/etcd-manager/pkg/backup"
 	"kope.io/etcd-manager/pkg/contextutil"
+	"kope.io/etcd-manager/pkg/legacy"
 	"kope.io/etcd-manager/pkg/privateapi"
 )
 
@@ -50,6 +51,17 @@ func NewEtcdServer(baseDir string, clusterName string, etcdNodeConfiguration *pr
 	// Make sure we have read state from disk before serving
 	if err := s.initState(); err != nil {
 		return nil, err
+	}
+
+	if s.state == nil {
+		if state, err := legacy.ImportExistingEtcd(baseDir, etcdNodeConfiguration); err != nil {
+			return nil, err
+		} else {
+			if err := writeState(s.baseDir, state); err != nil {
+				return nil, err
+			}
+			s.state = state
+		}
 	}
 
 	protoetcd.RegisterEtcdManagerServiceServer(peerServer.GrpcServer(), s)

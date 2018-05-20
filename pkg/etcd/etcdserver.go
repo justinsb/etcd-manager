@@ -142,7 +142,7 @@ func (s *EtcdServer) runOnce() error {
 	if s.process != nil {
 		exitError, exitState := s.process.ExitState()
 		if exitError != nil || exitState != nil {
-			glog.Warningf("etc process exited (error=%v, state=%v)", exitError, exitState)
+			glog.Warningf("etcd process exited (error=%v, state=%v)", exitError, exitState)
 
 			s.process = nil
 		}
